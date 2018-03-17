@@ -1,25 +1,36 @@
+# This script is used to generate test data for OpenCV deep learning module.
 import numpy as np
 import tensorflow as tf
 import os
 import argparse
 import struct
 import cv2 as cv
-from prepare_for_dnn import prepare_for_dnn
 
-parser = argparse.ArgumentParser(description='Script for OpenCV\'s DNN module '
-                                             'test data generation')
-parser.add_argument('-f', dest='freeze_graph_tool', required=True,
-                    help='Path to freeze_graph.py tool')
-parser.add_argument('-o', dest='optimizer_tool', required=True,
-                    help='Path to optimize_for_inference.py tool')
-parser.add_argument('-t', dest='transform_graph_tool', required=True,
-                    help='Path to transform_graph tool')
-args = parser.parse_args()
+from tensorflow.python.tools import optimize_for_inference_lib
+from tensorflow.tools.graph_transforms import TransformGraph
 
 np.random.seed(2701)
 
 def gen_data(placeholder):
-    return np.random.standard_normal(placeholder.shape).astype(placeholder.dtype.as_numpy_dtype())
+    shape = placeholder.shape.as_list()
+    shape[0] = shape[0] if shape[0] else 1  # batch size = 1 instead None
+    return np.random.standard_normal(shape).astype(placeholder.dtype.as_numpy_dtype())
+
+def prepare_for_dnn(sess, graph_def, in_node, out_node, out_graph, dtype, optimize=True, quantize=False):
+    # Freeze graph. Replaces variables to constants.
+    graph_def = tf.graph_util.convert_variables_to_constants(sess, graph_def, [out_node])
+    if optimize:
+        # Optimize graph. Removes training-only ops, unused nodes.
+        graph_def = optimize_for_inference_lib.optimize_for_inference(graph_def, [in_node], [out_node], dtype.as_datatype_enum)
+        # Fuse constant operations.
+        transforms = ["fold_constants(ignore_errors=True)"]
+        if quantize:
+            transforms += ["quantize_weights(minimum_size=0)"]
+        transforms += ["sort_by_execution_order"]
+        graph_def = TransformGraph(graph_def, [in_node], [out_node], transforms)
+    # Serialize
+    with tf.gfile.FastGFile(out_graph, 'wb') as f:
+            f.write(graph_def.SerializeToString())
 
 tf.reset_default_graph()
 tf.Graph().as_default()
@@ -37,7 +48,22 @@ def writeBlob(data, name):
         # Save raw data.
         np.save(name + '.npy', data.astype(np.float32))
 
-def save(inp, out, name):
+def runModel(inp, out, name):
+    with tf.Session(graph=tf.Graph()) as localSession:
+        localSession.graph.as_default()
+
+        with tf.gfile.FastGFile(name + '_net.pb') as f:
+            graph_def = tf.GraphDef()
+            graph_def.ParseFromString(f.read())
+        tf.import_graph_def(graph_def, name='')
+
+        inputData = gen_data(inp)
+        outputData = localSession.run(localSession.graph.get_tensor_by_name(out.name),
+                                      feed_dict={localSession.graph.get_tensor_by_name(inp.name): inputData})
+        writeBlob(inputData, name + '_in')
+        writeBlob(outputData, name + '_out')
+
+def save(inp, out, name, quantize=False, optimize=True):
     sess.run(tf.global_variables_initializer())
 
     inputData = gen_data(inp)
@@ -45,13 +71,9 @@ def save(inp, out, name):
     writeBlob(inputData, name + '_in')
     writeBlob(outputData, name + '_out')
 
-    saver = tf.train.Saver()
-    saver.save(sess, 'tmp.ckpt')
-    tf.train.write_graph(sess.graph.as_graph_def(), "", "graph.pb")
-    prepare_for_dnn('graph.pb', 'tmp.ckpt', args.freeze_graph_tool,
-                    args.optimizer_tool, args.transform_graph_tool,
-                    inp.name[:inp.name.rfind(':')], out.name[:out.name.rfind(':')],
-                    name + '_net.pb', inp.dtype)
+    prepare_for_dnn(sess, sess.graph.as_graph_def(), inp.name[:inp.name.rfind(':')],
+                    out.name[:out.name.rfind(':')], name + '_net.pb', inp.dtype,
+                    optimize, quantize)
 
     # By default, float16 weights are stored in repeated tensor's field called
     # `half_val`. It has type int32 with leading zeros for unused bytes.
@@ -250,37 +272,35 @@ bn = tf.layers.batch_normalization(inp, training=isTraining, fused=False, name='
                                    moving_mean_initializer=tf.random_uniform_initializer(-2, 1),
                                    moving_variance_initializer=tf.random_uniform_initializer(0.1, 2),)
 save(inp, bn, 'batch_norm_text')
-# Override the graph by a frozen one.
-os.rename('frozen_graph.pb', 'batch_norm_text_net.pb')
 ################################################################################
 inp = tf.placeholder(tf.float32, [2, 4, 5], 'input')
 flatten = tf.contrib.layers.flatten(inp)
 save(inp, flatten, 'flatten')
 ################################################################################
 # Generate test data for MobileNet-SSD object detection model from TensorFlow
-# model zoo, https://github.com/tensorflow/models/tree/master/research/object_detection
-# 1. Download and extract ssd_mobilenet_v1_coco.tar.gz
+# model zoo, http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v1_coco_11_06_2017.tar.gz
+# 1. Download and extract an archive
 # 2. Place frozen_inference_graph.pb as a ssd_mobilenet_v1_coco.pb nearby this script
 with tf.gfile.FastGFile('../ssd_mobilenet_v1_coco.pb') as f:
     # Load the model
     graph_def = tf.GraphDef()
     graph_def.ParseFromString(f.read())
 
-with tf.Session() as sess:
+with tf.Session(graph=tf.Graph()) as localSession:
     # Restore session
-    sess.graph.as_default()
+    localSession.graph.as_default()
     tf.import_graph_def(graph_def, name='')
 
     # Receive output
     inp = cv.imread('../street.png')
     inp = cv.resize(inp, (300, 300))
     inp = inp[:, :, [2, 1, 0]]  # BGR2RGB
-    out = sess.run([sess.graph.get_tensor_by_name('concat:0'),    # All detections
-                    sess.graph.get_tensor_by_name('concat_1:0'),  # Classification
-                    sess.graph.get_tensor_by_name('num_detections:0'),     # Postprocessed output
-                    sess.graph.get_tensor_by_name('detection_scores:0'),   #
-                    sess.graph.get_tensor_by_name('detection_boxes:0'),    #
-                    sess.graph.get_tensor_by_name('detection_classes:0')], #
+    out = localSession.run([localSession.graph.get_tensor_by_name('concat:0'),    # All detections
+                            localSession.graph.get_tensor_by_name('concat_1:0'),  # Classification
+                            localSession.graph.get_tensor_by_name('num_detections:0'),     # Postprocessed output
+                            localSession.graph.get_tensor_by_name('detection_scores:0'),   #
+                            localSession.graph.get_tensor_by_name('detection_boxes:0'),    #
+                            localSession.graph.get_tensor_by_name('detection_classes:0')], #
                    feed_dict={'image_tensor:0': inp.reshape(1, inp.shape[0], inp.shape[1], 3)})
     np.save('ssd_mobilenet_v1_coco.concat.npy', out[0])
     np.save('ssd_mobilenet_v1_coco.concat_1.npy', out[1])
@@ -296,20 +316,155 @@ with tf.Session() as sess:
     detections = sorted(detections[0, 0, :, :], cmp=lambda x, y: -1 if x[1] < y[1] and x[2] < y[2] else 0)
     np.save('ssd_mobilenet_v1_coco.detection_out.npy', detections)
 ################################################################################
+inp = tf.placeholder(tf.float32, [1, 2, 3, 4], 'input')
+conv = tf.layers.conv2d(inp, filters=5, kernel_size=[1, 1],
+                        activation=tf.nn.relu,
+                        bias_initializer=tf.random_normal_initializer())
+flattened = tf.reshape(conv, [1, -1], 'reshaped')
+biases = tf.Variable(tf.random_normal([10]), name='matmul_biases')
+weights = tf.Variable(tf.random_normal([2*3*5, 10]), name='matmul_weights')
+mm = tf.matmul(flattened, weights) + biases
+save(inp, mm, 'nhwc_reshape_matmul')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 2, 3, 4], 'input')
+conv = tf.layers.conv2d(inp, filters=5, kernel_size=[1, 1],
+                        activation=tf.nn.relu,
+                        bias_initializer=tf.random_normal_initializer())
+transposed = tf.transpose(conv, [0, 1, 2, 3])
+flattened = tf.reshape(transposed, [1, -1], 'reshaped')
+biases = tf.Variable(tf.random_normal([10]), name='matmul_biases')
+weights = tf.Variable(tf.random_normal([2*3*5, 10]), name='matmul_weights')
+mm = tf.matmul(flattened, weights) + biases
+save(inp, flattened, 'nhwc_transpose_reshape_matmul')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 6, 5, 3], 'input')
+conv = tf.layers.conv2d(inputs=inp, filters=3, kernel_size=[1, 1],
+                        activation=tf.nn.relu,
+                        bias_initializer=tf.random_normal_initializer())
+save(inp, conv, 'uint8_single_conv', quantize=True)
+runModel(inp, conv, 'uint8_single_conv')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 4, 4, 1], 'input')
+conv = tf.layers.conv2d(inp, filters=3, kernel_size=[3, 3], padding='SAME')
+pool = tf.layers.average_pooling2d(conv, pool_size=3, strides=1, padding='SAME')
+save(inp, pool, 'ave_pool_same')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 4, 6, 1], 'input')
+conv = tf.layers.conv2d(inp, filters=3, kernel_size=[1, 1], padding='SAME')
+sliced = tf.slice(conv, [0, 1, 2, 0], [-1, 3, 4, 1])
+save(inp, sliced, 'slice_4d')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 4, 4, 1], 'input')
+#                                             ky kx out in
+deconv_weights = tf.Variable(tf.random_normal([3, 3, 2, 1], dtype=tf.float32))
+deconv = tf.nn.conv2d_transpose(inp, deconv_weights,
+                                output_shape=[1, 4, 4, 2], strides=[1, 1, 1, 1],
+                                padding='SAME')
+leakyRelu = tf.nn.leaky_relu(deconv, alpha=0.2)
+save(inp, leakyRelu, 'deconvolution_same')
+# ################################################################################
+inp = tf.placeholder(tf.float32, [1, 3, 3, 1], 'input')
+deconv_weights = tf.Variable(tf.random_normal([3, 3, 2, 1], dtype=tf.float32))
+deconv = tf.nn.conv2d_transpose(inp, deconv_weights,
+                                output_shape=[1, 5, 5, 2], strides=[1, 2, 2, 1],
+                                padding='SAME')
+save(inp, deconv, 'deconvolution_stride_2_same')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 3, 2, 1], 'input')
+deconv_weights = tf.Variable(tf.random_normal([3, 3, 2, 1], dtype=tf.float32))
+deconv = tf.nn.conv2d_transpose(inp, deconv_weights,
+                                output_shape=[1, 8, 6, 2], strides=[1, 2, 2, 1],
+                                padding='VALID')
+save(inp, deconv, 'deconvolution_adj_pad_valid')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 2, 2, 1], 'input')
+deconv_weights = tf.Variable(np.ones([3, 3, 1, 1]), dtype=tf.float32)
+deconv = tf.nn.conv2d_transpose(inp, deconv_weights,
+                                output_shape=[1, 4, 4, 1], strides=[1, 2, 2, 1],
+                                padding='SAME')
+save(inp, deconv, 'deconvolution_adj_pad_same')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 3, 4, 5], 'input')
+gamma = tf.Variable(tf.random_normal([5], dtype=tf.float32))
+beta = tf.Variable(tf.random_normal([5], dtype=tf.float32))
+bn = tf.nn.fused_batch_norm(inp, gamma, beta, epsilon=1e-5, is_training=True)[0]
+save(inp, bn, 'mvn_batch_norm')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 1, 1, 5], 'input')
+gamma = tf.Variable(tf.random_normal([5], dtype=tf.float32))
+beta = tf.Variable(tf.random_normal([5], dtype=tf.float32))
+bn = tf.nn.fused_batch_norm(inp, gamma, beta, epsilon=1e-5, is_training=True)[0]
+save(inp, bn, 'mvn_batch_norm_1x1')
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 2, 3, 4], 'input')
+bn = tf.layers.batch_normalization(inp, training=False, fused=False, name='unfused_batch_norm',
+                                   beta_initializer=tf.random_normal_initializer(),
+                                   gamma_initializer=tf.random_normal_initializer(),
+                                   moving_mean_initializer=tf.random_uniform_initializer(-2, 1),
+                                   moving_variance_initializer=tf.random_uniform_initializer(0.1, 2),)
+save(inp, bn, 'unfused_batch_norm', optimize=False)
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 2, 3, 4], 'input')
+bn = tf.layers.batch_normalization(inp, training=False, fused=True, name='fused_batch_norm_no_gamma',
+                                   beta_initializer=tf.random_normal_initializer(),
+                                   scale=False,
+                                   moving_mean_initializer=tf.random_uniform_initializer(-2, 1),
+                                   moving_variance_initializer=tf.random_uniform_initializer(0.1, 2),)
+save(inp, bn, 'fused_batch_norm_no_gamma', optimize=False)
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 2, 3, 4], 'input')
+bn = tf.layers.batch_normalization(inp, training=False, fused=False, name='unfused_batch_norm_no_gamma',
+                                   beta_initializer=tf.random_normal_initializer(),
+                                   scale=False,
+                                   moving_mean_initializer=tf.random_uniform_initializer(-2, 1),
+                                   moving_variance_initializer=tf.random_uniform_initializer(0.1, 2),)
+save(inp, bn, 'unfused_batch_norm_no_gamma', optimize=False)
+################################################################################
+inp = tf.placeholder(tf.float32, [1, 2, 3], 'input')
+flatten = tf.contrib.layers.flatten(inp)
+save(inp, flatten, 'unfused_flatten', optimize=False)
+################################################################################
+inp = tf.placeholder(tf.float32, [None, 2, 3], 'input')
+flatten = tf.contrib.layers.flatten(inp)
+save(inp, flatten, 'unfused_flatten_unknown_batch', optimize=False)
+################################################################################
+from tensorflow import keras as K
+model = K.models.Sequential()
+model.add(K.layers.Softmax(name='keras_softmax', input_shape=(2, 3, 4)))
+sess = K.backend.get_session()
+sess.as_default()
+save(sess.graph.get_tensor_by_name('keras_softmax_input:0'),
+     sess.graph.get_tensor_by_name('keras_softmax/truediv:0'), 'keras_softmax', optimize=False)
+################################################################################
+model = K.models.Sequential()
+model.add(K.layers.Conv2D(filters=4, kernel_size=1, data_format='channels_last',
+                          name='keras_mobilenet_head_conv', input_shape=(2, 3, 4)))
+model.add(K.layers.GlobalAveragePooling2D(name='keras_mobilenet_head_pool'))
+model.add(K.layers.Reshape((1, 1, 4), name='keras_mobilenet_head_reshape'))
+sess = K.backend.get_session()
+sess.as_default()
+save(sess.graph.get_tensor_by_name('keras_mobilenet_head_conv_input:0'),
+     sess.graph.get_tensor_by_name('keras_mobilenet_head_reshape/Reshape:0'),
+     'keras_mobilenet_head', optimize=False)
+################################################################################
+def keras_relu6(x):
+    return K.activations.relu(x, max_value=6)
+
+inp = K.Input(shape=(2, 3, 4), name='keras_relu6_input')
+relu = K.layers.Activation(keras_relu6, name='keras_relu6')(inp)
+model = K.Model(inp, relu)
+sess = K.backend.get_session()
+sess.as_default()
+save(sess.graph.get_tensor_by_name('keras_relu6_input:0'),
+     sess.graph.get_tensor_by_name('keras_relu6/clip_by_value:0'), 'keras_relu6', optimize=False)
+################################################################################
+inp = tf.placeholder(tf.float32, [2, 3, 4, 5], 'input')
+reduced = tf.reduce_mean(inp, axis=[1, 2], keepdims=True)
+save(inp, reduced, 'reduce_mean')
+################################################################################
 
 # Uncomment to print the final graph.
 # with tf.gfile.FastGFile('fused_batch_norm_net.pb') as f:
 #     graph_def = tf.GraphDef()
 #     graph_def.ParseFromString(f.read())
 #     print graph_def
-
-def rm(f):
-    if os.path.exists(f):
-        os.remove(f)
-
-rm('checkpoint')
-rm('graph.pb')
-rm('frozen_graph.pb')
-rm('tmp.ckpt.data-00000-of-00001')
-rm('tmp.ckpt.index')
-rm('tmp.ckpt.meta')
